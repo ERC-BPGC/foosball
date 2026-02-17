@@ -27,35 +27,42 @@
     *   **Performance**: Achieved ~25 FPS with Large model on 4060Ti (PyTorch).
     *   **Drivers**: Solved `cv2` issues and V4L2 MJPEG bandwidth issues.
 
+
 ## Phase 3: Dual Camera & 3D/Triangulation (IN PROGRESS)
 *   **Goal**:
     1.  Setup 2x PS3 Eye Cameras.
     2.  Calibration (Checkerboard/ArUco).
     3.  Triangulation (Combine feeds for 3D pos).
-*   **Status**: **PARTIALLY COMPLETE**.
+*   **Status**: **ADVANCED (Near Complete)**.
 
 ### What is Done:
 1.  **Hardware**: 2x PS3 Eyes set up and working with `pseyepy` / MJPEG drivers.
 2.  **Calibration**:
     *   **Solution**: `src/calibrate_field.py`.
     *   **Method**: Used **ArUco Markers (8 total)** instead of checkerboard for robust auto-detection.
-    *   **Logic**: Maps Pixels -> Table Millimeters (Homography). This *is* the "Triangulation" for a flat table (z=0). We don't need full 3D stereo reconstruction because the ball is always on the table surface.
-3.  **Inference**:
+    *   **Logic**: Maps Pixels -> Table Millimeters (Homography).
+3.  **Coordinate Mapping**:
+    *   **Solution**: `src/coordinate_mapper.py`.
+    *   **Logic**: Handles Lens Distortion (Intrinsics) + Perspective Transform (Homography) to convert $(u,v)$ pixels to $(x,y)$ millimeters.
+4.  **Inference Integration**:
     *   `src/dual_infer.py`: Runs detection on both Left and Right streams.
+    *   **Integrated**: Now uses `CoordinateMapper` to output **Real World Millimeters** for detected balls.
 
 ### What is Left (The "Todo"):
-1.  **Fusion Logic**: Currently `dual_infer.py` just *shows* boxes. It needs to:
-    *   Convert Box Center $(u,v)$ -> World $(x,y)$ using the Calibration JSON.
-    *   Handle the overlap (if both cameras see the ball, which x,y do we trust?).
-2.  **Optimization (Critical)**:
+1.  **Fusion Logic**: Currently `dual_infer.py` calculates world coordinates for Left and Right independently.
+    *   **Task**: Implement logic to merge/average these coordinates when the ball is seen by both cameras, or select the best one.
+2.  **Code Cleanup**:
+    *   `dual_infer.py` currently defines its own `ThreadedCamera` class. It should import the shared `PS3EyeStream` from `src/driver.py`.
+3.  **Optimization (Critical)**:
     *   Current speed: Running `D-FINE-L` twice (Left + Right) is slow.
     *   **Solution**: Batch Inference or TensorRT (Phase 3.2).
-3.  **Tracking**:
+4.  **Tracking**:
     *   Implement Kalman Filter to smooth the noisy $(x,y)$ data and predict trajectory.
 
 ---
 
-## Action Plan to Comlete Phase 3
-1.  **Refactor Drivers**: Update `dual_infer.py` to use the high-speed `PS3EyeStream` class from `aruco_finall.py`.
-2.  **Integrate Calibration**: Update `dual_infer.py` to load `calibration_0.json` and `calibration_2.json` and print **Real World Millimeters** instead of pixels.
-3.  **Coordinate Fusion**: Write the logic to merge Left/Right coordinates.
+## Action Plan to Complete Phase 3
+1.  **Refactor Drivers**: Update `dual_infer.py` to use the high-speed `PS3EyeStream` class from `src/driver.py`.
+2.  **Coordinate Fusion**: Write the logic to merge Left/Right coordinates into a single $(x,y)$ state.
+3.  **Kalman Filter**: Implement tracking to smooth the fused coordinates.
+

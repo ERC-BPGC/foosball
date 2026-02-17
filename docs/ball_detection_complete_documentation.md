@@ -25,14 +25,24 @@ Build a professional-grade, high-speed vision system for a robotic foosball tabl
 
 ## 3. Software Architecture
 
-### A. Driver Layer (`src/aruco_finall.py`)
+### A. Driver Layer (`src/driver.py`)
 This is the **"Gold Standard"** reference for how we access the cameras.
+*   **Class**: `PS3EyeStream`
 *   **Backend**: `cv2.CAP_V4L2` (Video4Linux2).
 *   **Format**: **MJPEG** (`cv2.VideoWriter_fourcc(*'MJPG')`).
     *   *Why?* Raw YUYV data overloads the USB 2.0 bus when using 2 cameras. MJPEG compresses frames, allowing high FPS on dual streams.
-*   ** threading**: Uses `Thread(target=self.update, ...)` to capture frames in the background, preventing I/O blocking.
+*   **Threading**: Uses `Thread(target=self.update, ...)` to capture frames in the background, preventing I/O blocking.
+*   *Note*: Currently `dual_infer.py` uses a local duplicate of this class. Unification is pending.
 
-### B. Calibration (`src/calibrate_field.py`)
+### B. Coordinate Mapping (`src/coordinate_mapper.py`)
+The bridge between Camera Pixels and Real World.
+*   **Inputs**:
+    *   `config/lens_intrinsics_{side}.json` (Lens Distortion)
+    *   `config/calibration_{id}.json` (Homography)
+*   **Function**: `pixel_to_world(u, v) -> (x_mm, y_mm)` with correct undistortion.
+
+### C. Calibration (`src/calibrate_field.py`)
+
 Maps Camera Pixels $(u, v)$ to Table Millimeters $(x, y)$.
 *   **Method**: ArUco Markers (4x4, Dictionary 50).
 *   **Markers Setup**: 8 Markers total, placed on the rail borders.
@@ -54,14 +64,17 @@ Maps Camera Pixels $(u, v)$ to Table Millimeters $(x, y)$.
 *   **Output**: Saves Homography Matrix to `config/calibration_{id}.json`.
 *   **Visualization**: Projects a "Yellow Rectangle" representing the ideal field boundaries back onto the video feed to visually confirm accuracy.
 
-### C. Inference Engine (`src/dual_infer.py`)
+### D. Inference Engine (`src/dual_infer.py`)
 *   **Model**: **D-FINE** (Large variant).
+
 *   **Weights Path**: `/code/custom_dfine_exp_2x4090_refined_data_2025-07-03/model.pt`.
 *   **Logic**:
     1.  Loads D-FINE model onto CUDA.
-    2.  Reads Left & Right frames (Sequential processing currently).
+    2.  Reads Left & Right frames.
     3.  Runs Inference: `model(frame)`.
-    4.  Visualizes Bounding Boxes + Confidence.
+    4.  **Mapping**: Uses `CoordinateMapper` to convert detection boxes to World Coordinates.
+    5.  Visualizes Bounding Boxes + Confidence + $(x, y)$ coordinates.
+
 *   **Current Bottleneck**: Running Large model twice per frame (Left+Right) takes time.
 *   **Future Fix (Phase 3.2)**: Export to **TensorRT** (NVIDIA Hardware Acceleration) for 2-4x speedup.
 
@@ -80,9 +93,11 @@ Maps Camera Pixels $(u, v)$ to Table Millimeters $(x, y)$.
 ~/balltrack/code/custom_d_fine/
 ├── config.yaml          # Main Config
 ├── src/
-│   ├── driver.py        # (PROPOSED) Consolidated Camera Class
+│   ├── driver.py        # Consolidated Camera Class (PS3EyeStream)
+│   ├── coordinate_mapper.py # Pixel -> World Mapper
 │   ├── calibrate_field.py # Active Calibration Tool
 │   ├── dual_infer.py    # Active Inference Tool
+│   ├── dual_cam.py      # Dual Camera Viewer (Debug Tool)
 │   ├── fast_infer.py    # Backup Single-Cam Tool
 │   ├── d_fine/          # Model Architecture
 │   └── infer/           # Inference Utils
@@ -90,7 +105,8 @@ Maps Camera Pixels $(u, v)$ to Table Millimeters $(x, y)$.
 ```
 
 ## 7. Immediate Roadmap
-1.  **Consolidate Drivers**: Move the excellent `PS3EyeStream` class from `aruco_finall.py` into a shared `src/driver.py`.
-2.  **Update Inference**: Modify `dual_infer.py` to use `src/driver.py`.
+1.  **Consolidate Drivers**: Refactor `dual_infer.py` to import `src/driver.py` instead of defining its own camera class.
+2.  **Fusion Logic**: Merge the $(x, y)$ outputs from Left and Right cameras into a single tracked object.
+
 3.  **Optimize**: Convert Model to TensorRT (Phase 3.2).
 4.  **Track**: Implement Kalman Filter for ball prediction.

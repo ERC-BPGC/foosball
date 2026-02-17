@@ -122,6 +122,46 @@ def extrapolate_corner(detected_map, corner_ids):
     
     return corner_ids[miss_idx], pred_pt
 
+# ==============================================================================
+# FIXED SAVE FUNCTION (Place this BEFORE main)
+# ==============================================================================
+def save_calib(cam_id, side, H, all_offsets):
+    try:
+        print(f">>> Attempting to save {side} camera settings...")
+        
+        # 1. Sanitize the offsets (Ensure they are Python ints, not Numpy ints)
+        # JSON cannot serialize numpy integers, which causes silent failures.
+        side_offsets = {k: int(v) for k, v in all_offsets.items() if k.startswith(side)}
+        raw_offsets_safe = {k: int(v) for k, v in all_offsets.items()}
+
+        data = {
+            "homography_matrix": H.tolist(),
+            "side": side,
+            "field_dims": [float(FIELD_W), float(FIELD_H)], # Ensure floats
+            "offsets": side_offsets,
+            "raw_slider_values": raw_offsets_safe 
+        }
+        
+        # 2. Setup Path
+        filename = f"calibration_{cam_id}.json"
+        out_dir = Path("config")
+        out_dir.mkdir(parents=True, exist_ok=True) # Force create folder
+        
+        out_path = out_dir / filename
+        
+        # 3. Write
+        with open(out_path, "w") as f:
+            json.dump(data, f, indent=4)
+            
+        print(f"✅ SUCCESS: Saved {side} config to {out_path.absolute()}")
+        
+    except Exception as e:
+        print(f"❌ ERROR SAVING CONFIG: {e}")
+        import traceback
+        traceback.print_exc()
+
+# ... (Now define process_frame, main, etc.)
+
 def process_frame(frame, side, detector):
     """Main pipeline: Detect -> Extrapolate -> Homography -> Draw Tunable Box"""
     if frame is None: return frame, None
@@ -288,24 +328,6 @@ def main():
     cam_left.stop()
     cam_right.stop()
     cv2.destroyAllWindows()
-
-def save_calib(cam_id, side, H, all_offsets):
-    # Filter offsets for this specific side
-    side_offsets = {k:v for k,v in all_offsets.items() if k.startswith(side)}
-    
-    data = {
-        "homography_matrix": H.tolist(),
-        "side": side,
-        "field_dims": [FIELD_W, FIELD_H],
-        "offsets": side_offsets,
-        "raw_slider_values": all_offsets # Backup for reloading UI later
-    }
-    
-    p = Path(f"config/calibration_{cam_id}.json")
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "w") as f:
-        json.dump(data, f, indent=4)
-    print(f"   [OK] Saved {side} config to {p}")
 
 if __name__ == "__main__":
     main()
