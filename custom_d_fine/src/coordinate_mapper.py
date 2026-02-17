@@ -1,63 +1,97 @@
 import cv2
 import numpy as np
 import json
+import logging
 from pathlib import Path
+from typing import Tuple, Optional
+
+# Configure clean logging
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
 class CoordinateMapper:
-    def __init__(self, cam_id, side):
-        self.side = side
+    def __init__(self, cam_id: int, side: str, config_dir: str = "config"):
+        """
+        Robust Coordinate Mapper for Foosball Table.
+        
+        Args:
+            cam_id (int): Camera ID (e.g., 2 or 3)
+            side (str): 'left' or 'right'
+            config_dir (str): Directory where JSON configs are stored
+        """
         self.cam_id = cam_id
-        
-        # Paths to your config files
-        # These are the files you created in Phase 1 and with the GUI
-        self.lens_path = Path(f"config/lens_intrinsics_{side}.json")
-        self.field_path = Path(f"config/calibration_{cam_id}.json")
-        
-        self._load_configs()
+        self.side = side.lower()
+        self.config_dir = Path(config_dir)
 
-    def _load_configs(self):
-        # 1. Load Lens Intrinsics (K and D)
-        # K = Camera Matrix (Focal length, optical center)
-        # D = Distortion Coefficients (How much the lens bends light)
-        if not self.lens_path.exists():
-            print(f"Warning: Lens config not found for {self.side}. Using identity.")
-            self.K = np.eye(3)
-            self.D = np.zeros(5)
+        # Matrices
+        self.K = None # Camera Matrix
+        self.D = None # Distortion Coeffs
+        self.H = None # Homography Matrix
+
+        # Load Configuration immediately
+        self._load_configurations()
+
+    def _load_configurations(self):
+        """Loads Lens Intrinsics and Homography matrices from JSON."""
+        lens_path = self.config_dir / f"lens_intrinsics_{self.side}.json"
+        field_path = self.config_dir / f"calibration_{self.cam_id}.json"
+
+        # 1. Load Lens Intrinsics (K, D)
+        if not lens_path.exists():
+            logging.warning(f"{self.side.upper()} Lens config missing at {lens_path}. Using identity (No Distortion Correction).")
+            self.K = np.eye(3, dtype=np.float64)
+            self.D = np.zeros(5, dtype=np.float64)
         else:
-            with open(self.lens_path, "r") as f:
-                lens_data = json.load(f)
-                self.K = np.array(lens_data["camera_matrix"], dtype=np.float64)
-                self.D = np.array(lens_data["dist_coeffs"], dtype=np.float64)
+            try:
+                with open(lens_path, "r") as f:
+                    data = json.load(f)
+                    self.K = np.array(data["camera_matrix"], dtype=np.float64)
+                    self.D = np.array(data["dist_coeffs"], dtype=np.float64)
+            except Exception as e:
+                logging.error(f"Failed to load Lens config: {e}")
+                self.K = np.eye(3)
+                self.D = np.zeros(5)
 
         # 2. Load Field Homography (H)
-        # H = Homography Matrix (Maps pixels to millimeters)
-        if not self.field_path.exists():
-            raise FileNotFoundError(f"CRITICAL: Missing field calibration for {self.side} (ID {self.cam_id}). Run the GUI first!")
-            
-        with open(self.field_path, "r") as f:
-            field_data = json.load(f)
-            self.H = np.array(field_data["homography_matrix"], dtype=np.float64)
-            
-        print(f"[{self.side.upper()}] Mapper Initialized.")
+        if not field_path.exists():
+            raise FileNotFoundError(f"CRITICAL: Field calibration missing for {self.side} (ID {self.cam_id}). Run calibration first!")
+        
+        try:
+            with open(field_path, "r") as f:
+                data = json.load(f)
+                self.H = np.array(data["homography_matrix"], dtype=np.float64)
+                logging.info(f"[{self.side.upper()}] Mapper Initialized successfully.")
+        except Exception as e:
+            raise RuntimeError(f"Corrupt Field config for {self.side}: {e}")
 
-    def pixel_to_world(self, u, v):
+    def pixel_to_world(self, u: float, v: float) -> Tuple[float, float]:
         """
-        Converts raw pixel (u, v) -> World (x_mm, y_mm)
+        Converts raw pixel coordinates (u, v) -> Global World coordinates (x_mm, y_mm).
+        
+        Logic:
+        1. Undistort point (Fix fisheye/lens curvature).
+        2. Apply Homography (Map flat 2D point to Global Table Coordinates).
+        
+        Note: The 'Global Shift' is handled automatically by H if calibration 
+              used global marker coordinates.
         """
-        # Step 1: Undistort Point
-        # We assume the point is a 2D pixel coordinate.
-        # This function corrects the "fisheye" effect.
-        src_pt = np.array([[[u, v]]], dtype=np.float64)
-        
-        # P=self.K ensures we get back pixel coordinates, not normalized ones.
-        undistorted_pt = cv2.undistortPoints(src_pt, self.K, self.D, P=self.K)
-        
-        # Step 2: Perspective Transform (Homography)
-        # Maps the straight pixel to the table surface (mm)
-        world_pt = cv2.perspectiveTransform(undistorted_pt, self.H)
-        
-        # Extract x, y
-        x_mm = world_pt[0][0][0]
-        y_mm = world_pt[0][0][1]
-        
-        return x_mm, y_mm
+        if self.H is None:
+            return (0.0, 0.0)
+
+        # Step 1: Format point for OpenCV (1, 1, 2)
+        # We use float64 for precision
+        src_point = np.array([[[u, v]]], dtype=np.float64)
+
+        # Step 2: Undistort
+        # P=self.K ensures the output remains in the pixel coordinate space (linearized),
+        # rather than normalized camera coordinates.
+        undistorted_point = cv2.undistortPoints(src_point, self.K, self.D, P=self.K)
+
+        # Step 3: Perspective Transform (Homography)
+        # H maps Linearized Pixels -> Global Millimeters
+        dst_point = cv2.perspectiveTransform(undistorted_point, self.H)
+
+        # Extract coordinates
+        global_x = float(dst_point[0][0][0])
+        global_y = float(dst_point[0][0][1])
+
+        return global_x, global_y
