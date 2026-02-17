@@ -1,0 +1,152 @@
+project_name: football_indepth_det
+exp_name: custom_dfine_08-01
+exp: ${exp_name}_${now_dir}
+model_name: l
+
+train:
+  root: /home/aksh/balltrack
+  pretrained_dataset: obj2coco
+  pretrained_model_path: ${train.root}/code/custom_dfine_exp_2x4090_refined_data_2025-07-03/model.pt
+
+  data_path: ${train.root}/data/dataset
+  path_to_test_data: ${train.root}/input/frames
+  path_to_save: ${train.root}/output/detections
+
+  debug_img_path: ${train.root}/output/debug_images
+  eval_preds_path: ${train.root}/output/eval_preds
+  bench_img_path: ${train.root}/output/bench_imgs
+  infer_path: ${train.root}/output/infer_head
+
+  use_wandb: true
+  device: cuda
+  label_to_name:
+    0: ball
+  use_one_class: true
+
+  img_size:
+    - 1280
+    - 1280
+  keep_ratio: false
+  to_visualize_eval: true
+  debug_img_processing: true
+
+  amp_enabled: true
+  clip_max_norm: 0.1
+
+  batch_size: 7
+  b_accum_steps: 1
+  epochs: 83
+  early_stopping: 10
+  ignore_background_epochs: 0
+  num_workers: 12
+
+  conf_thresh: 0.5
+  iou_thresh: 0.5
+
+  use_ema: true
+  ema_momentum: 0.9998
+
+  base_lr: ${train.lrs.${model_name}.base_lr}
+  backbone_lr: ${train.lrs.${model_name}.backbone_lr}
+  cycler_pct_start: 0.1
+  weight_decay: 0.000125
+  betas:
+    - 0.9
+    - 0.999
+  label_smoothing: 0.0
+
+  mosaic_augs:
+    mosaic_prob: 0.8
+    no_mosaic_epochs: 5
+    mosaic_scale:
+      - 0.5
+      - 1.5
+    degrees: 0.0
+    translate: 0.2
+    shear: 2.0
+
+  augs:
+    multiscale_prob: 0.5
+    rotate_90: 0.05
+    left_right_flip: 0.7
+    up_down_flip: 0.0
+    to_gray: 0.01
+    blur: 0.05
+    gamma: 0.02
+    brightness: 0.02
+    noise: 0.01
+  
+  seed: 42
+  cudnn_fixed: false
+
+  lrs:
+    'n':
+      backbone_lr: 0.0004
+      base_lr: 0.0008
+    s:
+      backbone_lr: 6.0e-05
+      base_lr: 0.00025
+    m:
+      backbone_lr: 2.0e-05
+      base_lr: 0.00015
+    l:
+      backbone_lr: 6.25e-06
+      base_lr: 0.000125
+    x:
+      backbone_lr: 1.5e-06
+      base_lr: 0.0001
+
+split:
+  ignore_negatives: false
+  shuffle: true
+  train_split: 0.8
+  val_split: 0.2
+
+export:
+  half: false
+  max_batch_size: 1
+  dynamic_input: false
+
+infer:
+  to_crop: true
+  paddings:
+    w: 0.05
+    h: 0.05
+  source: folder      # "folder" or "webcam"
+  webcam_id: 0        # Webcam device ID (default 0)
+
+# --- Head-filter config ---
+filter:
+  enabled: true
+  head_model_path: ${train.root}/models/best.pt
+  head_conf_threshold: 0.2       # confidence to accept a head
+  head_iou_threshold: 0.2         # (optional) not used for NMS here, but kept for future
+  crop_scale: 1               # how much larger than the ball box to crop for the head check
+  proximity_factor: 1.5           # max distance (in ball-diagonal units) from ball center
+  min_overlap: 0.05               # require tiny overlap with ball crop (guards far audience heads)
+  save_debug: true                # write head-debug visuals
+  max_heads_to_draw: 10            # keep head-debug images readable
+
+# --- Output toggles (new) ---
+outputs:
+  save_detections: true         # kept ball detections
+  save_distractors: true        # filtered-out (head) detections
+  save_dfine_crops: true        # the expanded crops we run the head model on
+  save_images: true             # annotated full frames
+  save_labels: true             # yolo txt with confidence
+  csv_stats: true               # all_frame_stats.csv
+
+
+
+now_dir: ${now:%Y-%m-%d}
+
+defaults:
+  - _self_
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .
+

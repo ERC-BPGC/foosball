@@ -1,0 +1,30 @@
+{
+    "homography_matrix": [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0]
+    ],
+    "side": "left",
+    "field_dims": {
+        "half_width_mm": 343.5,
+        "half_height_mm": 586.0,
+        "full_width_mm": 687.0,
+        "full_height_mm": 1172.0
+    },
+    "offsets": {
+        "left_top": 4,
+        "left_bottom": 41,
+        "left_left": 12,
+        "left_right": 16
+    },
+    "raw_slider_values": {
+        "left_top": 4,
+        "left_bottom": 41,
+        "left_left": 12,
+        "left_right": 16,
+        "right_top": 39,
+        "right_bottom": 6,
+        "right_left": 9,
+        "right_right": 6
+    }
+}

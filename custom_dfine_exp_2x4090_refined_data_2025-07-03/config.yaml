@@ -1,0 +1,93 @@
+project_name: football_indepth_det
+exp_name: custom_dfine_exp_2x4090_refined_data
+exp: ${exp_name}_${now_dir}
+model_name: l
+train:
+  root: /home/samal/custom_dfine/data/
+  pretrained_dataset: obj2coco
+  pretrained_model_path: pretrained/dfine_${model_name}_${train.pretrained_dataset}.pth
+  data_path: ${train.root}
+  path_to_test_data: /mnt/nas/Innovation Labs/Quickflip/datasets/prashant/54min_vid2frames_yolo_data/frames
+  path_to_save: ${train.root}/outputs/${exp}
+  debug_img_path: ${train.root}/output/debug_images
+  eval_preds_path: ${train.root}/output/eval_preds
+  bench_img_path: /media/prashant/T7 Shield/pd/dfine_bench
+  infer_path: /mnt/nas/Innovation Labs/Quickflip/datasets/prashant/predict/54min_vid2frames_yolo_pred
+  use_wandb: true
+  device: cuda:1
+  label_to_name:
+    0: ball
+  use_one_class: true
+  img_size:
+  - 1280
+  - 1280
+  keep_ratio: false
+  to_visualize_eval: true
+  debug_img_processing: true
+  amp_enabled: true
+  clip_max_norm: 0.1
+  batch_size: 8
+  b_accum_steps: 5
+  epochs: 70
+  early_stopping: 10
+  ignore_background_epochs: 0
+  num_workers: 12
+  conf_thresh: 0.5
+  iou_thresh: 0.5
+  use_ema: true
+  ema_momentum: 0.9998
+  base_lr: ${train.lrs.${model_name}.base_lr}
+  backbone_lr: ${train.lrs.${model_name}.backbone_lr}
+  cycler_pct_start: 0.1
+  weight_decay: 0.00025
+  betas:
+  - 0.9
+  - 0.98
+  label_smoothing: 0.1
+  mosaic_augs:
+    mosaic_prob: 0.8
+    no_mosaic_epochs: 5
+    mosaic_scale:
+    - 0.5
+    - 1.5
+    degrees: 0.0
+    translate: 0.2
+    shear: 2.0
+  augs:
+    multiscale_prob: 0.4
+    rotate_90: 0.05
+    left_right_flip: 0.2
+    up_down_flip: 0.0
+    to_gray: 0.01
+    blur: 0.06
+    gamma: 0.02
+    brightness: 0.02
+    noise: 0.01
+  seed: 42
+  cudnn_fixed: false
+  lrs:
+    'n':
+      backbone_lr: 0.0004
+      base_lr: 0.0008
+    s:
+      backbone_lr: 6.0e-05
+      base_lr: 0.00025
+    m:
+      backbone_lr: 2.0e-05
+      base_lr: 0.00015
+    l:
+      backbone_lr: 6.25e-06
+      base_lr: 0.000125
+    x:
+      backbone_lr: 1.5e-06
+      base_lr: 0.0001
+split:
+  ignore_negatives: false
+  shuffle: true
+  train_split: 0.8
+  val_split: 0.2
+export:
+  half: false
+  max_batch_size: 1
+  dynamic_input: false
+now_dir: ${now:%Y-%m-%d}
