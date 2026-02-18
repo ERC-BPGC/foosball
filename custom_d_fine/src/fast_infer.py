@@ -33,7 +33,7 @@ CONFIG = {
     },
 
     # Webcam Device ID (0 is usually default, 1 might be external USB)
-    "webcam_id": 2,
+    "webcam_id": 1,
 
     # Visualization
     # Set to False to disable window drawing for maximum performance

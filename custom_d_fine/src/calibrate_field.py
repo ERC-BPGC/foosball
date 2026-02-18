@@ -13,8 +13,8 @@ FIELD_W = 687.0 / 2.0   # 343.5 mm (Half Width)
 FIELD_H = 1172.0 / 2.0  # 586.0 mm (Half Height)
 
 # Distance from Center of Table to Marker Center (Rail Position)
-MARKER_X_DIST = FIELD_W + 50.0  
-MARKER_Y_DIST = FIELD_H + 50.0  
+MARKER_X_DIST = FIELD_W + 56.5  
+MARKER_Y_DIST = FIELD_H + 31.3  
 
 # Default Offsets
 current_offsets = {

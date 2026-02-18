@@ -8,6 +8,10 @@ import logging
 from pathlib import Path
 from typing import Tuple, Optional
 from src.infer.torch_model import Torch_model
+import serial
+
+SERIAL_PORT = '/dev/ttyACM0' 
+BAUD_RATE = 9600
 
 # ==============================================================================
 # CONFIGURATION
@@ -191,6 +195,14 @@ def main():
     cam_r = ThreadedCamera(CONFIG["right_id"]).start()
     time.sleep(1.0) # Warmup
 
+    # 4. Initialize Serial
+    ser = None
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+        print(f"[INFO] Serial initialized on {SERIAL_PORT} @ {BAUD_RATE}")
+    except Exception as e:
+        print(f"[WARNING] Could not open serial port: {e}")
+
     print(">>> TRACKING STARTED. Press 'q' to quit.")
     prev_time = 0
     
@@ -248,7 +260,16 @@ def main():
             elif ball_pos_r:
                 final_x, final_y = ball_pos_r
 
-            # E. Visualization
+            # E. Serial Output
+            if ser and ser.is_open and final_x is not None:
+                try:
+                    # Format: "X,Y\n" (e.g., "120,45\n")
+                    msg = f"{int(final_x)},{int(final_y)}\n"
+                    ser.write(msg.encode('utf-8'))
+                except Exception as e:
+                    print(f"[ERROR] Serial Write Failed: {e}")
+
+            # F. Visualization
             if CONFIG["visualize"]:
                 # Calculate FPS
                 curr_time = time.time()

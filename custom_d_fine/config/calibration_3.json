@@ -1,14 +1,14 @@
 {
     "homography_matrix": [
         [
-            -2.4317266670725384,
-            0.09685690962068594,
-            862.6274721404474
+            -2.4750729377063907,
+            0.09190685347269001,
+            743.0246972951601
         ],
         [
-            0.06495008749172697,
-            2.1533452083795668,
-            -896.4623412432663
+            0.03958192990240566,
+            2.130827226412843,
+            -847.2099783840133
         ],
         [
             0.0,
@@ -22,19 +22,19 @@
         586.0
     ],
     "offsets": {
-        "right_top": 10,
-        "right_bottom": -91,
-        "right_left": -92,
-        "right_right": -97
+        "right_top": -7,
+        "right_bottom": -62,
+        "right_left": -94,
+        "right_right": -91
     },
     "raw_slider_values": {
-        "left_top": -95,
-        "left_bottom": 8,
-        "left_left": -100,
-        "left_right": -101,
-        "right_top": 10,
-        "right_bottom": -91,
-        "right_left": -92,
-        "right_right": -97
+        "left_top": -73,
+        "left_bottom": -1,
+        "left_left": -104,
+        "left_right": -90,
+        "right_top": -7,
+        "right_bottom": -62,
+        "right_left": -94,
+        "right_right": -91
     }
 }
