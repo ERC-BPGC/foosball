@@ -2,332 +2,339 @@ import cv2
 import numpy as np
 import json
 import time
-from threading import Thread
+import threading
 from pathlib import Path
 
 # ==============================================================================
-# 1. CONSTANTS & CONFIGURATION
+# CONFIGURATION
 # ==============================================================================
-# Field Dimensions (mm)
-FIELD_W = 687.0 / 2.0   # 343.5 mm (Half Width)
-FIELD_H = 1172.0 / 2.0  # 586.0 mm (Half Height)
+# Camera IDs — must match dual_infer.py
+LEFT_CAM_ID = 3    # Top in display (left side of table)
+RIGHT_CAM_ID = 2   # Bottom in display (right side of table)
 
-# Distance from Center of Table to Marker Center (Rail Position)
-MARKER_X_DIST = FIELD_W + 56.5  
-MARKER_Y_DIST = FIELD_H + 31.3  
+# Field Dimensions (mm) — half-values
+HALF_W = 344.25    # Half width of playing field
+FIELD_H = 586.0   # Half height (one camera covers this much)
 
-# Default Offsets
-current_offsets = {
-    # Left Camera (Top Half)
-    "left_top": 4, 
-    "left_bottom": 41,
-    "left_left": 12,    
-    "left_right": 16,  
-    
-    # Right Camera (Bottom Half)
-    "right_top": 39,    
-    "right_bottom": 6, 
-    "right_left": 9, 
-    "right_right": 6
+# World coordinates for clicked corners (TL, TR, BR, BL order)
+# Origin (0,0) is at the seam between the two cameras:
+#   - Bottom-right midpoint of top rectangle
+#   - Top midpoint of bottom rectangle
+WORLD_POINTS = {
+    "left": np.array([   # Top camera covers positive Y
+        [-HALF_W,  FIELD_H],   # TL
+        [ HALF_W,  FIELD_H],   # TR
+        [ HALF_W,  0.0    ],   # BR
+        [-HALF_W,  0.0    ],   # BL
+    ], dtype=np.float32),
+    "right": np.array([  # Bottom camera covers negative Y
+        [-HALF_W,  0.0     ],  # TL
+        [ HALF_W,  0.0     ],  # TR
+        [ HALF_W, -FIELD_H ],  # BR
+        [-HALF_W, -FIELD_H ],  # BL
+    ], dtype=np.float32),
 }
 
+CORNER_LABELS = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
+CORNER_COLORS = [(0, 200, 255), (0, 255, 0), (255, 0, 100), (255, 100, 0)]
+
 # ==============================================================================
-# 2. HELPER CLASSES
+# THREADED CAMERA (same as dual_infer.py)
 # ==============================================================================
-class PS3EyeStream:
-    def __init__(self, index=0, width=640, height=480, fps=60):
-        self.stream = cv2.VideoCapture(index, cv2.CAP_V4L2)
-        # Force MJPEG for High FPS / Low Latency
-        self.stream.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        self.stream.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.stream.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.stream.set(cv2.CAP_PROP_FPS, fps)
-        
-        self.stopped = False
-        self.frame = None
-        self.is_opened = self.stream.isOpened()
-        
-        if self.is_opened:
-            (grabbed, frame) = self.stream.read()
-            self.frame = frame if grabbed else np.zeros((height, width, 3), np.uint8)
-        else:
-            print(f"[ERROR] Camera {index} could not be opened.")
+class ThreadedCamera:
+    def __init__(self, src=0, width=640, height=480, fps=60):
+        self.cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.cap.set(cv2.CAP_PROP_FPS, fps)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        self.grabbed, self.frame = self.cap.read()
+        self.started = False
+        self.read_lock = threading.Lock()
 
     def start(self):
-        if self.is_opened:
-            Thread(target=self.update, args=(), daemon=True).start()
+        if self.started:
+            return self
+        self.started = True
+        self.thread = threading.Thread(target=self._update, daemon=True)
+        self.thread.start()
         return self
 
-    def update(self):
-        while not self.stopped:
-            grabbed, frame = self.stream.read()
-            if grabbed: 
+    def _update(self):
+        while self.started:
+            grabbed, frame = self.cap.read()
+            if not grabbed:
+                time.sleep(0.005)
+                continue
+            with self.read_lock:
+                self.grabbed = grabbed
                 self.frame = frame
-            else:
-                self.stopped = True
-                break
-        self.stream.release()
 
-    def read(self): 
-        return self.frame
+    def read(self):
+        with self.read_lock:
+            return self.grabbed, self.frame
 
-    def stop(self): 
-        self.stopped = True
+    def stop(self):
+        self.started = False
+        self.thread.join()
+        self.cap.release()
 
 # ==============================================================================
-# 3. MAPPING & UTILITIES
+# CLICK HANDLER
 # ==============================================================================
-MARKER_MAP = {
-    1: (-MARKER_X_DIST, MARKER_Y_DIST), 6: (0, MARKER_Y_DIST), 2: (MARKER_X_DIST, MARKER_Y_DIST),
-    5: (-MARKER_X_DIST, 0), 7: (MARKER_X_DIST, 0),
-    4: (-MARKER_X_DIST, -MARKER_Y_DIST), 8: (0, -MARKER_Y_DIST), 3: (MARKER_X_DIST, -MARKER_Y_DIST)
-}
+clicked_points = []
 
-SIDE_CONFIG = {
-    "left":  {"markers": [1, 6, 2, 5, 7], "rect": [1, 2, 7, 5]}, # Top Half
-    "right": {"markers": [5, 7, 4, 8, 3], "rect": [5, 7, 3, 4]}  # Bottom Half
-}
+def mouse_callback(event, x, y, flags, param):
+    """Collect clicked points (up to 4)."""
+    if event == cv2.EVENT_LBUTTONDOWN and len(clicked_points) < 4:
+        clicked_points.append((x, y))
+        print(f"  [{len(clicked_points)}/4] Clicked: ({x}, {y}) — {CORNER_LABELS[len(clicked_points)-1]}")
 
-def get_roi_points(side):
-    """Calculates dynamic visual box based on real-time sliders."""
-    if side == "left":
-        # Top Half (Positive Y)
-        y_top = FIELD_H - current_offsets["left_top"]
-        y_btm = 0 + current_offsets["left_bottom"]
-        x_left = -FIELD_W + current_offsets["left_left"]
-        x_right = FIELD_W - current_offsets["left_right"]
-        return [(x_left, y_top), (x_right, y_top), (x_right, y_btm), (x_left, y_btm)]
-    else:
-        # Bottom Half (Negative Y)
-        y_top = 0 - current_offsets["right_top"]
-        y_btm = -FIELD_H + current_offsets["right_bottom"]
-        x_left = -FIELD_W + current_offsets["right_left"]
-        x_right = FIELD_W - current_offsets["right_right"]
-        return [(x_left, y_top), (x_right, y_top), (x_right, y_btm), (x_left, y_btm)]
+# ==============================================================================
+# APPLY SAME FLIPS AS dual_infer.py
+# ==============================================================================
+def apply_flips(frame):
+    """Apply the same flips as dual_infer.py: horizontal on read, vertical for display."""
+    # Step 1: Horizontal flip (same as dual_infer.py does on read)
+    frame_h = cv2.flip(frame, 1)
+    # Step 2: Vertical flip (same as dual_infer.py does before display)
+    frame_hv = cv2.flip(frame_h, 0)
+    return frame_h, frame_hv
 
-def extrapolate_corner(detected_map, corner_ids):
-    """Finds the 4th corner if only 3 are visible using parallelogram logic."""
-    found_indices = [i for i, mid in enumerate(corner_ids) if mid in detected_map]
+# ==============================================================================
+# CALIBRATE ONE CAMERA
+# ==============================================================================
+def calibrate_camera(cam, cam_id, side, win_name):
+    """
+    Interactive calibration for one camera.
     
-    if len(found_indices) != 3: return None, None
+    The user clicks 4 corners on the DISPLAY frame (which has both H+V flips).
+    We un-do the vertical flip to get coordinates in INFERENCE space (H-flip only),
+    since dual_infer.py runs inference on the H-flipped frame.
     
-    p = [None]*4
-    for i in found_indices: 
-        p[i] = np.array(detected_map[corner_ids[i]])
-    
-    miss_idx = [i for i in range(4) if i not in found_indices][0]
-    
-    pred_pt = None
-    if miss_idx == 0: pred_pt = p[1] + p[3] - p[2]
-    elif miss_idx == 1: pred_pt = p[0] + p[2] - p[3]
-    elif miss_idx == 2: pred_pt = p[3] + p[1] - p[0]
-    elif miss_idx == 3: pred_pt = p[2] + p[0] - p[1]
-    
-    return corner_ids[miss_idx], pred_pt
+    Returns the homography matrix or None.
+    """
+    global clicked_points
+    clicked_points = []
 
-def save_calib(cam_id, side, H, all_offsets):
-    """Saves calibration data to JSON with explicit type casting."""
-    try:
-        # 1. Filter and Sanitize Offsets
-        side_offsets = {k: int(v) for k, v in all_offsets.items() if k.startswith(side)}
-        raw_offsets_safe = {k: int(v) for k, v in all_offsets.items()}
+    cv2.namedWindow(win_name, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(win_name, mouse_callback)
 
-        data = {
-            "homography_matrix": H.tolist(),
-            "side": side,
-            "field_dims": [float(FIELD_W), float(FIELD_H)],
-            "offsets": side_offsets,
-            "raw_slider_values": raw_offsets_safe 
-        }
-        
-        # 2. Prepare Directory
-        out_dir = Path("config")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"calibration_{cam_id}.json"
-        
-        # 3. Write File
-        with open(out_path, "w") as f:
-            json.dump(data, f, indent=4)
-            
-        print(f"[SUCCESS] Saved {side} config to {out_path}")
-        return True
-        
-    except Exception as e:
-        print(f"[ERROR] Failed to save {side} config: {e}")
-        return False
+    print(f"\n{'='*50}")
+    print(f"  CALIBRATING: {side.upper()} CAMERA (ID {cam_id})")
+    print(f"{'='*50}")
+    print(f"  Click the 4 corners of the playing field in order:")
+    print(f"    1. Top-Left    2. Top-Right")
+    print(f"    3. Bottom-Right  4. Bottom-Left")
+    print(f"  [R] = Redo  |  [S] = Save  |  [Q] = Skip\n")
 
-def process_frame(frame, side, detector):
-    """Pipeline: Detect Markers -> Extrapolate -> Homography -> Draw UI"""
-    if frame is None: return frame, None
-
-    # Detect Markers
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    corners, ids, _ = detector.detectMarkers(gray)
-    cv2.aruco.drawDetectedMarkers(frame, corners, ids)
-
-    detected_map = {}
-    image_points = []
-    object_points = []
-
-    valid_ids = SIDE_CONFIG[side]["markers"]
-    rect_ids = SIDE_CONFIG[side]["rect"]
-
-    if ids is not None:
-        ids = ids.flatten()
-        for i, mid in enumerate(ids):
-            if mid in valid_ids:
-                c = corners[i][0]
-                cx, cy = np.mean(c[:, 0]), np.mean(c[:, 1])
-                detected_map[mid] = [cx, cy]
-                image_points.append([cx, cy])
-                object_points.append(MARKER_MAP[mid])
-
-    # Extrapolate Missing Corner if needed
-    m_id, pred_pt = extrapolate_corner(detected_map, rect_ids)
-    if m_id:
-        pt_int = (int(pred_pt[0]), int(pred_pt[1]))
-        cv2.circle(frame, pt_int, 8, (0,0,255), -1)
-        cv2.putText(frame, f"Sim: {m_id}", (pt_int[0]+10, pt_int[1]), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
-        image_points.append(pred_pt)
-        object_points.append(MARKER_MAP[m_id])
-
-    # Compute Homography
     H_matrix = None
-    if len(image_points) >= 4:
-        try:
-            # 1. Find Homography
-            H_matrix, _ = cv2.findHomography(np.array(image_points, dtype=np.float32), 
-                                           np.array(object_points, dtype=np.float32))
-            
-            # Safety Check: If H_matrix is None (RANSAC failure), skip
-            if H_matrix is not None:
-                # 2. Project Tunable Box
-                H_inv = np.linalg.inv(H_matrix)
-                roi = get_roi_points(side)
-                pixel_poly = []
-                for pt in roi:
-                    vec = np.array([pt[0], pt[1], 1.0])
-                    px = np.dot(H_inv, vec)
-                    
-                    # Avoid division by zero
-                    scale = px[2] if px[2] != 0 else 1.0
-                    px /= scale
-                    
-                    pixel_poly.append([int(px[0]), int(px[1])])
-                
-                # 3. Visual Feedback (Draw)
-                pts = np.array(pixel_poly, np.int32)
-                pts = pts.reshape((-1, 1, 2)) # Ensure correct shape for polylines
-                cv2.polylines(frame, [pts], True, (0, 255, 255), 3)
-                cv2.putText(frame, "LOCKED", (20, 440), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
-                
-        except Exception as e:
-            # PRINT THE ERROR so we know what's wrong!
-            print(f"[WARN] Draw Error ({side}): {e}")
-            pass
-    
-    return frame, H_matrix
-
-# ==============================================================================
-# 4. MAIN LOOP
-# ==============================================================================
-def nothing(x): pass
-
-def main():
-    print("[INFO] Starting Air Hockey Calibration Tool")
-    print("[INFO] Initializing Cameras...")
-
-    # Initialize Cameras
-    # ID 2 = Left (Top View), ID 3 = Right (Bottom View)
-    cam_left = PS3EyeStream(index=2).start()
-    cam_right = PS3EyeStream(index=3).start()
-    time.sleep(1.0) # Warmup
-
-    # Setup ArUco
-    aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-    detector = cv2.aruco.ArucoDetector(aruco_dict, cv2.aruco.DetectorParameters())
-
-    # GUI Setup
-    cv2.namedWindow("Tuning Controls", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Tuning Controls", 600, 500)
-
-    # Sliders
-    def create_slider(name, default):
-        cv2.createTrackbar(name, "Tuning Controls", default + 200, 400, nothing)
-
-    # Auto-generate sliders based on current_offsets keys
-    for key, val in current_offsets.items():
-        # Shorten names for UI: "left_top" -> "L_Top"
-        name = key.replace("left_", "L_").replace("right_", "R_").capitalize()
-        create_slider(name, int(val))
-
-    print("\n[INFO] Controls:")
-    print("  [Sliders] : Tune field boundaries")
-    print("  [S]       : Save Configuration")
-    print("  [Q]       : Quit")
-
-    H_left_final = None
-    H_right_final = None
 
     while True:
-        # Update Slider Values (Reading back from UI)
-        for key in current_offsets.keys():
-            ui_name = key.replace("left_", "L_").replace("right_", "R_").capitalize()
-            current_offsets[key] = cv2.getTrackbarPos(ui_name, "Tuning Controls") - 200
+        ret, raw_frame = cam.read()
+        if not ret or raw_frame is None:
+            continue
 
-        # Read Frames
-        f_left = cam_left.read()
-        f_right = cam_right.read()
+        # Apply same flips as dual_infer.py
+        frame_infer, frame_display = apply_flips(raw_frame)
+        h, w = frame_display.shape[:2]
 
-        if f_left is not None and f_right is not None:
-            # Process frames BEFORE flipping (ArUco requires original orientation)
-            f_left_proc, hl = process_frame(f_left, "left", detector)
-            f_right_proc, hr = process_frame(f_right, "right", detector)
-            
-            # Store valid homographies
-            if hl is not None: H_left_final = hl
-            if hr is not None: H_right_final = hr
+        # Draw existing clicked points
+        vis = frame_display.copy()
+        for i, pt in enumerate(clicked_points):
+            color = CORNER_COLORS[i]
+            cv2.circle(vis, pt, 8, color, -1)
+            cv2.putText(vis, CORNER_LABELS[i], (pt[0]+12, pt[1]+5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            # Connect consecutive corners
+            if i > 0:
+                cv2.line(vis, clicked_points[i-1], pt, (255, 255, 255), 2)
 
-            # Display Logic: Flip Left Camera so it aligns visually with Right Camera
-            f_left_display = cv2.flip(f_left_proc, 0) 
+        # Close polygon if all 4 clicked
+        if len(clicked_points) == 4:
+            cv2.line(vis, clicked_points[3], clicked_points[0], (255, 255, 255), 2)
+            # Fill polygon semi-transparent
+            overlay = vis.copy()
+            pts_arr = np.array(clicked_points, np.int32).reshape((-1, 1, 2))
+            cv2.fillPoly(overlay, [pts_arr], (0, 255, 255, 80))
+            vis = cv2.addWeighted(overlay, 0.3, vis, 0.7, 0)
 
-            # Stack Views
-            combined = np.vstack((f_left_display, f_right_proc))
-            
-            # Resize for screen
-            scale = 0.8
-            h, w = combined.shape[:2]
-            view = cv2.resize(combined, (int(w*scale), int(h*scale)))
+        # HUD
+        if len(clicked_points) < 4:
+            next_corner = CORNER_LABELS[len(clicked_points)]
+            hud = f"{side.upper()} (ID {cam_id}) | Click: {next_corner} ({len(clicked_points)}/4)"
+            hud_color = (0, 200, 255)
+        else:
+            hud = f"{side.upper()} (ID {cam_id}) | DONE! [S]=Save  [R]=Redo  [Q]=Skip"
+            hud_color = (0, 255, 0)
 
-            cv2.imshow("Calibration View", view)
+        cv2.rectangle(vis, (0, 0), (w, 35), (0, 0, 0), -1)
+        cv2.putText(vis, hud, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, hud_color, 2)
 
+        cv2.imshow(win_name, vis)
         key = cv2.waitKey(1) & 0xFF
-        
+
+        if key == ord('r'):
+            # Redo
+            clicked_points = []
+            H_matrix = None
+            print(f"  [REDO] Cleared points for {side}. Click again.")
+
+        elif key == ord('s') and len(clicked_points) == 4:
+            # Convert display clicks → inference-space coordinates
+            # Display has H+V flip. Inference space has only H flip.
+            # So we need to undo the V flip: y_infer = h - y_display
+            infer_points = []
+            for (px, py) in clicked_points:
+                infer_points.append([px, h - py])
+            
+            pixel_pts = np.array(infer_points, dtype=np.float32)
+            world_pts = WORLD_POINTS[side]
+
+            H_matrix, status = cv2.findHomography(pixel_pts, world_pts)
+            if H_matrix is not None:
+                print(f"  [OK] Homography computed for {side}.")
+                # Save to file
+                save_calibration(cam_id, side, H_matrix)
+            else:
+                print(f"  [ERROR] Homography computation failed! Try again.")
+                clicked_points = []
+                continue
+            break
+
+        elif key == ord('q'):
+            print(f"  [SKIP] Skipping {side} calibration.")
+            break
+
+    cv2.destroyWindow(win_name)
+    return H_matrix
+
+# ==============================================================================
+# SAVE CALIBRATION
+# ==============================================================================
+def save_calibration(cam_id, side, H_matrix):
+    """Save homography to config/calibration_{cam_id}.json."""
+    out_dir = Path("config")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"calibration_{cam_id}.json"
+
+    data = {
+        "homography_matrix": H_matrix.tolist(),
+        "side": side,
+        "field_dims": [float(HALF_W), float(FIELD_H)],
+        "method": "manual_corners",
+    }
+
+    with open(out_path, "w") as f:
+        json.dump(data, f, indent=4)
+    
+    print(f"  [SAVED] {out_path}")
+
+# ==============================================================================
+# VERIFICATION: test a few points after calibration
+# ==============================================================================
+def verify_calibration(cam, cam_id, side, H_matrix, win_name):
+    """
+    After calibration, let the user click anywhere on the feed
+    and see the mapped world coordinate. Press Q to exit.
+    """
+    global clicked_points
+    clicked_points = []
+
+    cv2.namedWindow(win_name, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(win_name, mouse_callback)
+
+    print(f"\n  [VERIFY] Click anywhere to see world coordinates. [Q] = Done.")
+
+    while True:
+        ret, raw_frame = cam.read()
+        if not ret or raw_frame is None:
+            continue
+
+        frame_infer, frame_display = apply_flips(raw_frame)
+        h, w = frame_display.shape[:2]
+        vis = frame_display.copy()
+
+        # Draw all test clicks with their mapped coordinates
+        for pt in clicked_points:
+            px, py = pt
+            # Convert to inference space
+            infer_x, infer_y = px, h - py
+            # Apply homography
+            src = np.array([[[infer_x, infer_y]]], dtype=np.float64)
+            dst = cv2.perspectiveTransform(src, H_matrix)
+            wx, wy = dst[0][0][0], dst[0][0][1]
+
+            cv2.circle(vis, (px, py), 6, (0, 255, 0), -1)
+            cv2.putText(vis, f"({wx:.0f}, {wy:.0f})", (px+10, py-5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        # HUD
+        cv2.rectangle(vis, (0, 0), (w, 35), (0, 0, 0), -1)
+        cv2.putText(vis, f"VERIFY {side.upper()} | Click to test | [Q]=Done",
+                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+        cv2.imshow(win_name, vis)
+        key = cv2.waitKey(1) & 0xFF
+
         if key == ord('q'):
             break
-        
-        elif key == ord('s'):
-            print("\n[INFO] Triggering Save Sequence...")
-            
-            # Save Left
-            if H_left_final is not None:
-                save_calib(2, "left", H_left_final, current_offsets)
-            else:
-                print("[WARN] Left Camera (ID 2): No valid marker lock. Save Aborted.")
 
-            # Save Right
-            if H_right_final is not None:
-                save_calib(3, "right", H_right_final, current_offsets)
-            else:
-                print("[WARN] Right Camera (ID 3): No valid marker lock. Save Aborted.")
-            print("[INFO] Save Sequence Complete.\n")
+    cv2.destroyWindow(win_name)
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
+def main():
+    print("=" * 50)
+    print("  MANUAL FIELD CALIBRATION TOOL")
+    print("=" * 50)
+    print(f"  Left Camera  (top):    ID {LEFT_CAM_ID}")
+    print(f"  Right Camera (bottom): ID {RIGHT_CAM_ID}")
+    print(f"  Field: {HALF_W*2:.0f} x {FIELD_H*2:.0f} mm")
+    print(f"  Origin (0,0) at camera seam")
+    print()
+
+    # Start cameras
+    print("[INFO] Starting cameras...")
+    cam_l = ThreadedCamera(LEFT_CAM_ID).start()
+    cam_r = ThreadedCamera(RIGHT_CAM_ID).start()
+    time.sleep(1.0)
+
+    # Calibrate left (top) camera
+    H_left = calibrate_camera(cam_l, LEFT_CAM_ID, "left", "Calibrate LEFT (Top)")
+
+    # Verify left
+    if H_left is not None:
+        verify_calibration(cam_l, LEFT_CAM_ID, "left", H_left, "Verify LEFT")
+
+    # Calibrate right (bottom) camera
+    H_right = calibrate_camera(cam_r, RIGHT_CAM_ID, "right", "Calibrate RIGHT (Bottom)")
+
+    # Verify right
+    if H_right is not None:
+        verify_calibration(cam_r, RIGHT_CAM_ID, "right", H_right, "Verify RIGHT")
+
+    # Summary
+    print("\n" + "=" * 50)
+    print("  CALIBRATION COMPLETE")
+    print("=" * 50)
+    if H_left is not None:
+        print(f"  ✓ Left  (ID {LEFT_CAM_ID}) → config/calibration_{LEFT_CAM_ID}.json")
+    else:
+        print(f"  ✗ Left  (ID {LEFT_CAM_ID}) — skipped")
+    if H_right is not None:
+        print(f"  ✓ Right (ID {RIGHT_CAM_ID}) → config/calibration_{RIGHT_CAM_ID}.json")
+    else:
+        print(f"  ✗ Right (ID {RIGHT_CAM_ID}) — skipped")
 
     # Cleanup
-    cam_left.stop()
-    cam_right.stop()
+    cam_l.stop()
+    cam_r.stop()
     cv2.destroyAllWindows()
-    print("[INFO] Exiting.")
+    print("[INFO] Done.")
 
 if __name__ == "__main__":
     main()

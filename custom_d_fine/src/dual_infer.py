@@ -25,8 +25,8 @@ CONFIG = {
     "label_to_name": {0: "ball"},
     
     # Camera IDs (Must match your calibration IDs)
-    "left_id": 2,   
-    "right_id": 3,  
+    "left_id": 3,   
+    "right_id": 2,  
     
     # Options
     "visualize": True,
@@ -211,6 +211,8 @@ def main():
             # A. Read Frames
             ret_l, frame_l = cam_l.read()
             ret_r, frame_r = cam_r.read()
+            frame_l = cv2.flip(frame_l, 1)
+            frame_r = cv2.flip(frame_r, 1)  
             
             if not ret_l or frame_l is None or not ret_r or frame_r is None:
                 continue
@@ -222,31 +224,49 @@ def main():
             # C. Process Detections
             ball_pos_l = None
             ball_pos_r = None
+            h_l, w_l = frame_l.shape[:2]
+            h_r, w_r = frame_r.shape[:2]
 
-            # --- Left Camera ---
+            # --- Left Camera (ID 2) ---
+            det_l = None
             if len(results[0]["boxes"]) > 0:
-                # Take highest confidence ball
                 box = results[0]["boxes"][0]
                 cx, cy, x1, y1, x2, y2 = get_ball_contact_point(box)
                 wx, wy = mapper_l.pixel_to_world(cx, cy)
                 ball_pos_l = (wx, wy)
-                
-                if CONFIG["visualize"]:
-                    cv2.rectangle(frame_l, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(frame_l, f"L: {wx:.0f},{wy:.0f}", (x1, y1-10), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                det_l = (wx, wy, x1, y1, x2, y2)
 
-            # --- Right Camera ---
+            # --- Right Camera (ID 3) ---
+            det_r = None
             if len(results[1]["boxes"]) > 0:
                 box = results[1]["boxes"][0]
                 cx, cy, x1, y1, x2, y2 = get_ball_contact_point(box)
                 wx, wy = mapper_r.pixel_to_world(cx, cy)
                 ball_pos_r = (wx, wy)
-                
-                if CONFIG["visualize"]:
-                    cv2.rectangle(frame_r, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(frame_r, f"R: {wx:.0f},{wy:.0f}", (x1, y1-10), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                det_r = (wx, wy, x1, y1, x2, y2)
+
+            # Flip frames for correct display orientation BEFORE drawing text
+            # Camera 2 (left): orientation correct but text inverted -> vertical flip
+            frame_l = cv2.flip(frame_l, 0)
+            # Camera 3 (right): orientation incorrect -> vertical flip
+            frame_r = cv2.flip(frame_r, 0)
+
+            # Draw overlays on flipped frames with transformed coordinates
+            if det_l is not None and CONFIG["visualize"]:
+                wx, wy, x1, y1, x2, y2 = det_l
+                # Transform bbox coords for vertical flip
+                y1_f, y2_f = h_l - y2, h_l - y1
+                cv2.rectangle(frame_l, (x1, y1_f), (x2, y2_f), (0, 255, 0), 2)
+                cv2.putText(frame_l, f"L: {wx:.0f},{wy:.0f}", (x1, y1_f-10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+            if det_r is not None and CONFIG["visualize"]:
+                wx, wy, x1, y1, x2, y2 = det_r
+                # Transform bbox coords for vertical flip
+                y1_f, y2_f = h_r - y2, h_r - y1
+                cv2.rectangle(frame_r, (x1, y1_f), (x2, y2_f), (0, 255, 0), 2)
+                cv2.putText(frame_r, f"R: {wx:.0f},{wy:.0f}", (x1, y1_f-10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
             # D. Data Fusion (The Global Truth)
             final_x, final_y = None, None
@@ -276,11 +296,10 @@ def main():
                 fps = 1 / (curr_time - prev_time) if prev_time > 0 else 0
                 prev_time = curr_time
                 
-                # Flip Left for visual consistency
-                frame_l_vis = cv2.flip(frame_l, 0)
+                # Stack (both frames already flipped for correct orientation)
+                display = np.vstack((frame_l, frame_r))
+                # Flip laterally (horizontal mirror)
                 
-                # Stack
-                display = np.vstack((frame_l_vis, frame_r))
                 
                 # Draw Global Coordinate HUD
                 if final_x is not None:
