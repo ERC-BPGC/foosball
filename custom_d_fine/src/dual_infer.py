@@ -235,6 +235,7 @@ def main():
                 wx, wy = mapper_l.pixel_to_world(cx, cy)
                 ball_pos_l = (wx, wy)
                 det_l = (wx, wy, x1, y1, x2, y2)
+                cx_l, cy_l = cx, cy
 
             # --- Right Camera (ID 3) ---
             det_r = None
@@ -244,6 +245,7 @@ def main():
                 wx, wy = mapper_r.pixel_to_world(cx, cy)
                 ball_pos_r = (wx, wy)
                 det_r = (wx, wy, x1, y1, x2, y2)
+                cx_r, cy_r = cx, cy
 
             # Flip frames for correct display orientation BEFORE drawing text
             # Camera 2 (left): orientation correct but text inverted -> vertical flip
@@ -268,13 +270,25 @@ def main():
                 cv2.putText(frame_r, f"R: {wx:.0f},{wy:.0f}", (x1, y1_f-10), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-            # D. Data Fusion (The Global Truth)
+            # D. Data Fusion (Weighted by Distance from Center)
             final_x, final_y = None, None
             
             if ball_pos_l and ball_pos_r:
-                # Average both for stability
-                final_x = (ball_pos_l[0] + ball_pos_r[0]) / 2
-                final_y = (ball_pos_l[1] + ball_pos_r[1]) / 2
+                # Weighted Fusion
+                # Calculate pixel distance from center (where distortion is lowest)
+                center_l = np.array([w_l / 2, h_l / 2])
+                dist_l = np.linalg.norm(np.array([cx_l, cy_l]) - center_l)
+                weight_l = 1.0 / (dist_l + 1e-5) # Closer = Higher Weight
+
+                center_r = np.array([w_r / 2, h_r / 2])
+                dist_r = np.linalg.norm(np.array([cx_r, cy_r]) - center_r)
+                weight_r = 1.0 / (dist_r + 1e-5)
+
+                # Weighted Average
+                total_weight = weight_l + weight_r
+                final_x = (ball_pos_l[0] * weight_l + ball_pos_r[0] * weight_r) / total_weight
+                final_y = (ball_pos_l[1] * weight_l + ball_pos_r[1] * weight_r) / total_weight
+                
             elif ball_pos_l:
                 final_x, final_y = ball_pos_l
             elif ball_pos_r:
@@ -310,14 +324,16 @@ def main():
                     color = (0, 0, 255) # Red = Lost
                 
                 # Resize for display
+                # Resize for display
                 scale = 0.8
                 h, w = display.shape[:2]
-                display = cv2.resize(display, (int(w*scale), int(h*scale)))
+                new_w, new_h = int(w*scale), int(h*scale)
+                display = cv2.resize(display, (new_w, new_h))
                 
                 # Overlay HUD
-                cv2.rectangle(display, (0, 0), (w, 60), (0,0,0), -1)
-                cv2.putText(display, hud_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-                cv2.putText(display, f"FPS: {fps:.0f}", (int(w*scale)-150, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                cv2.rectangle(display, (0, 0), (new_w, 50), (0,0,0), -1)
+                cv2.putText(display, hud_text, (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                cv2.putText(display, f"FPS: {fps:.0f}", (new_w - 150, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                 
                 cv2.imshow("Project Pinpoint", display)
                 
