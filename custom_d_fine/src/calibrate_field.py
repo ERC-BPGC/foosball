@@ -1,45 +1,61 @@
 import cv2
+import time
+import torch
 import numpy as np
 import json
-import time
+import logging
 import threading
 from pathlib import Path
+from src.infer.torch_model import Torch_model
 
 # ==============================================================================
-# CONFIGURATION
+# 1. CONFIGURATION & PHYSICAL CONSTANTS
 # ==============================================================================
-# Camera IDs — must match dual_infer.py
-LEFT_CAM_ID = 3    # Top in display (left side of table)
-RIGHT_CAM_ID = 2   # Bottom in display (right side of table)
-
-# Field Dimensions (mm) — half-values
-HALF_W = 344.25    # Half width of playing field
-FIELD_H = 586.0   # Half height (one camera covers this much)
-
-# World coordinates for clicked corners (TL, TR, BR, BL order)
-# Origin (0,0) is at the seam between the two cameras:
-#   - Bottom-right midpoint of top rectangle
-#   - Top midpoint of bottom rectangle
-WORLD_POINTS = {
-    "left": np.array([   # Top camera covers positive Y
-        [-HALF_W,  FIELD_H],   # TL
-        [ HALF_W,  FIELD_H],   # TR
-        [ HALF_W,  0.0    ],   # BR
-        [-HALF_W,  0.0    ],   # BL
-    ], dtype=np.float32),
-    "right": np.array([  # Bottom camera covers negative Y
-        [-HALF_W,  0.0     ],  # TL
-        [ HALF_W,  0.0     ],  # TR
-        [ HALF_W, -FIELD_H ],  # BR
-        [-HALF_W, -FIELD_H ],  # BL
-    ], dtype=np.float32),
+CONFIG = {
+    "model_path": "/home/aksh/balltrack/code/custom_dfine_exp_2x4090_refined_data_2025-07-03/model.pt",
+    "model_name": "l",
+    "img_size": (960, 960), 
+    "conf_thresh": 0.5,
+    "label_to_name": {0: "ball"},
+    "left_id": 2,   
+    "right_id": 3,  
 }
 
-CORNER_LABELS = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
-CORNER_COLORS = [(0, 200, 255), (0, 255, 0), (255, 0, 100), (255, 100, 0)]
+# Physical Table Dimensions (mm)
+TABLE_L = 1172.0
+TABLE_W = 687.0
+BALL_DIA = 35.68
+
+# Calculated Math
+HALF_L = TABLE_L / 2.0
+HALF_W = TABLE_W / 2.0
+R = BALL_DIA / 2.0
+
+# When a ball is pushed against a corner, its center is 1 Radius away from the walls.
+X_LEFT = -HALF_W + R
+X_RIGHT = HALF_W - R
+Y_TOP = HALF_L - R         # Attacker side wall
+Y_BOTTOM = -HALF_L + R     # Goalie side wall
+Y_CENTER = 0.0             # The absolute seam
+
+# The Ground Truth World Coordinates for the Ball's Center
+CALIB_POINTS = {
+    "left": [
+        ("Top-Left Corner", (X_LEFT, Y_TOP)),
+        ("Top-Right Corner", (X_RIGHT, Y_TOP)),
+        ("Right Wall at Center Line", (X_RIGHT, Y_CENTER)),
+        ("Left Wall at Center Line", (X_LEFT, Y_CENTER))
+    ],
+    "right": [
+        ("Left Wall at Center Line", (X_LEFT, Y_CENTER)),
+        ("Right Wall at Center Line", (X_RIGHT, Y_CENTER)),
+        ("Bottom-Right Corner", (X_RIGHT, Y_BOTTOM)),
+        ("Bottom-Left Corner", (X_LEFT, Y_BOTTOM))
+    ]
+}
 
 # ==============================================================================
-# THREADED CAMERA (same as dual_infer.py)
+# 2. HELPER CLASSES
 # ==============================================================================
 class ThreadedCamera:
     def __init__(self, src=0, width=640, height=480, fps=60):
@@ -49,20 +65,17 @@ class ThreadedCamera:
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_FPS, fps)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
         self.grabbed, self.frame = self.cap.read()
         self.started = False
         self.read_lock = threading.Lock()
 
     def start(self):
-        if self.started:
-            return self
         self.started = True
-        self.thread = threading.Thread(target=self._update, daemon=True)
+        self.thread = threading.Thread(target=self.update, daemon=True)
         self.thread.start()
         return self
 
-    def _update(self):
+    def update(self):
         while self.started:
             grabbed, frame = self.cap.read()
             if not grabbed:
@@ -71,270 +84,176 @@ class ThreadedCamera:
             with self.read_lock:
                 self.grabbed = grabbed
                 self.frame = frame
-
+                
     def read(self):
-        with self.read_lock:
-            return self.grabbed, self.frame
+        with self.read_lock: return self.grabbed, self.frame
 
     def stop(self):
         self.started = False
         self.thread.join()
         self.cap.release()
 
-# ==============================================================================
-# CLICK HANDLER
-# ==============================================================================
-clicked_points = []
-
-def mouse_callback(event, x, y, flags, param):
-    """Collect clicked points (up to 4)."""
-    if event == cv2.EVENT_LBUTTONDOWN and len(clicked_points) < 4:
-        clicked_points.append((x, y))
-        print(f"  [{len(clicked_points)}/4] Clicked: ({x}, {y}) — {CORNER_LABELS[len(clicked_points)-1]}")
-
-# ==============================================================================
-# APPLY SAME FLIPS AS dual_infer.py
-# ==============================================================================
-def apply_flips(frame):
-    """Apply the same flips as dual_infer.py: horizontal on read, vertical for display."""
-    # Step 1: Horizontal flip (same as dual_infer.py does on read)
-    frame_h = cv2.flip(frame, 1)
-    # Step 2: Vertical flip (same as dual_infer.py does before display)
-    frame_hv = cv2.flip(frame_h, 0)
-    return frame_h, frame_hv
-
-# ==============================================================================
-# CALIBRATE ONE CAMERA
-# ==============================================================================
-def calibrate_camera(cam, cam_id, side, win_name):
-    """
-    Interactive calibration for one camera.
-    
-    The user clicks 4 corners on the DISPLAY frame (which has both H+V flips).
-    We un-do the vertical flip to get coordinates in INFERENCE space (H-flip only),
-    since dual_infer.py runs inference on the H-flipped frame.
-    
-    Returns the homography matrix or None.
-    """
-    global clicked_points
-    clicked_points = []
-
-    cv2.namedWindow(win_name, cv2.WINDOW_AUTOSIZE)
-    cv2.setMouseCallback(win_name, mouse_callback)
-
-    print(f"\n{'='*50}")
-    print(f"  CALIBRATING: {side.upper()} CAMERA (ID {cam_id})")
-    print(f"{'='*50}")
-    print(f"  Click the 4 corners of the playing field in order:")
-    print(f"    1. Top-Left    2. Top-Right")
-    print(f"    3. Bottom-Right  4. Bottom-Left")
-    print(f"  [R] = Redo  |  [S] = Save  |  [Q] = Skip\n")
-
-    H_matrix = None
-
-    while True:
-        ret, raw_frame = cam.read()
-        if not ret or raw_frame is None:
-            continue
-
-        # Apply same flips as dual_infer.py
-        frame_infer, frame_display = apply_flips(raw_frame)
-        h, w = frame_display.shape[:2]
-
-        # Draw existing clicked points
-        vis = frame_display.copy()
-        for i, pt in enumerate(clicked_points):
-            color = CORNER_COLORS[i]
-            cv2.circle(vis, pt, 8, color, -1)
-            cv2.putText(vis, CORNER_LABELS[i], (pt[0]+12, pt[1]+5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            # Connect consecutive corners
-            if i > 0:
-                cv2.line(vis, clicked_points[i-1], pt, (255, 255, 255), 2)
-
-        # Close polygon if all 4 clicked
-        if len(clicked_points) == 4:
-            cv2.line(vis, clicked_points[3], clicked_points[0], (255, 255, 255), 2)
-            # Fill polygon semi-transparent
-            overlay = vis.copy()
-            pts_arr = np.array(clicked_points, np.int32).reshape((-1, 1, 2))
-            cv2.fillPoly(overlay, [pts_arr], (0, 255, 255, 80))
-            vis = cv2.addWeighted(overlay, 0.3, vis, 0.7, 0)
-
-        # HUD
-        if len(clicked_points) < 4:
-            next_corner = CORNER_LABELS[len(clicked_points)]
-            hud = f"{side.upper()} (ID {cam_id}) | Click: {next_corner} ({len(clicked_points)}/4)"
-            hud_color = (0, 200, 255)
-        else:
-            hud = f"{side.upper()} (ID {cam_id}) | DONE! [S]=Save  [R]=Redo  [Q]=Skip"
-            hud_color = (0, 255, 0)
-
-        cv2.rectangle(vis, (0, 0), (w, 35), (0, 0, 0), -1)
-        cv2.putText(vis, hud, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, hud_color, 2)
-
-        cv2.imshow(win_name, vis)
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord('r'):
-            # Redo
-            clicked_points = []
-            H_matrix = None
-            print(f"  [REDO] Cleared points for {side}. Click again.")
-
-        elif key == ord('s') and len(clicked_points) == 4:
-            # Convert display clicks → inference-space coordinates
-            # Display has H+V flip. Inference space has only H flip.
-            # So we need to undo the V flip: y_infer = h - y_display
-            infer_points = []
-            for (px, py) in clicked_points:
-                infer_points.append([px, h - py])
-            
-            pixel_pts = np.array(infer_points, dtype=np.float32)
-            world_pts = WORLD_POINTS[side]
-
-            H_matrix, status = cv2.findHomography(pixel_pts, world_pts)
-            if H_matrix is not None:
-                print(f"  [OK] Homography computed for {side}.")
-                # Save to file
-                save_calibration(cam_id, side, H_matrix)
-            else:
-                print(f"  [ERROR] Homography computation failed! Try again.")
-                clicked_points = []
-                continue
-            break
-
-        elif key == ord('q'):
-            print(f"  [SKIP] Skipping {side} calibration.")
-            break
-
-    cv2.destroyWindow(win_name)
-    return H_matrix
-
-# ==============================================================================
-# SAVE CALIBRATION
-# ==============================================================================
-def save_calibration(cam_id, side, H_matrix):
-    """Save homography to config/calibration_{cam_id}.json."""
+def save_calibration(side, H_matrix):
     out_dir = Path("config")
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"calibration_{cam_id}.json"
-
+    out_path = out_dir / f"calibration_{side}.json"
+    
     data = {
         "homography_matrix": H_matrix.tolist(),
         "side": side,
-        "field_dims": [float(HALF_W), float(FIELD_H)],
-        "method": "manual_corners",
+        "field_dims": [TABLE_W, TABLE_L],
+        "method": "ai_ball_center"
     }
-
     with open(out_path, "w") as f:
         json.dump(data, f, indent=4)
-    
-    print(f"  [SAVED] {out_path}")
+    print(f"[SUCCESS] Saved {side} calibration to {out_path}")
 
 # ==============================================================================
-# VERIFICATION: test a few points after calibration
-# ==============================================================================
-def verify_calibration(cam, cam_id, side, H_matrix, win_name):
-    """
-    After calibration, let the user click anywhere on the feed
-    and see the mapped world coordinate. Press Q to exit.
-    """
-    global clicked_points
-    clicked_points = []
-
-    cv2.namedWindow(win_name, cv2.WINDOW_AUTOSIZE)
-    cv2.setMouseCallback(win_name, mouse_callback)
-
-    print(f"\n  [VERIFY] Click anywhere to see world coordinates. [Q] = Done.")
-
-    while True:
-        ret, raw_frame = cam.read()
-        if not ret or raw_frame is None:
-            continue
-
-        frame_infer, frame_display = apply_flips(raw_frame)
-        h, w = frame_display.shape[:2]
-        vis = frame_display.copy()
-
-        # Draw all test clicks with their mapped coordinates
-        for pt in clicked_points:
-            px, py = pt
-            # Convert to inference space
-            infer_x, infer_y = px, h - py
-            # Apply homography
-            src = np.array([[[infer_x, infer_y]]], dtype=np.float64)
-            dst = cv2.perspectiveTransform(src, H_matrix)
-            wx, wy = dst[0][0][0], dst[0][0][1]
-
-            cv2.circle(vis, (px, py), 6, (0, 255, 0), -1)
-            cv2.putText(vis, f"({wx:.0f}, {wy:.0f})", (px+10, py-5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-        # HUD
-        cv2.rectangle(vis, (0, 0), (w, 35), (0, 0, 0), -1)
-        cv2.putText(vis, f"VERIFY {side.upper()} | Click to test | [Q]=Done",
-                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-
-        cv2.imshow(win_name, vis)
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord('q'):
-            break
-
-    cv2.destroyWindow(win_name)
-
-# ==============================================================================
-# MAIN
+# 3. MAIN INTERACTIVE LOOP
 # ==============================================================================
 def main():
-    print("=" * 50)
-    print("  MANUAL FIELD CALIBRATION TOOL")
-    print("=" * 50)
-    print(f"  Left Camera  (top):    ID {LEFT_CAM_ID}")
-    print(f"  Right Camera (bottom): ID {RIGHT_CAM_ID}")
-    print(f"  Field: {HALF_W*2:.0f} x {FIELD_H*2:.0f} mm")
-    print(f"  Origin (0,0) at camera seam")
-    print()
+    print("==========================================")
+    print("   AI-ASSISTED FOOSBALL CALIBRATION Tool  ")
+    print("==========================================")
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[INFO] Loading AI Model on {device}...")
+    model = Torch_model(
+        model_name=CONFIG["model_name"],
+        model_path=CONFIG["model_path"],
+        n_outputs=len(CONFIG["label_to_name"]),
+        input_width=CONFIG["img_size"][1],
+        input_height=CONFIG["img_size"][0],
+        conf_thresh=CONFIG["conf_thresh"],
+        device=device,
+        rect=False,
+        half=True
+    )
+    model.warmup()
 
-    # Start cameras
-    print("[INFO] Starting cameras...")
-    cam_l = ThreadedCamera(LEFT_CAM_ID).start()
-    cam_r = ThreadedCamera(RIGHT_CAM_ID).start()
-    time.sleep(1.0)
+    print("[INFO] Starting Cameras...")
+    cam_l = ThreadedCamera(CONFIG["left_id"]).start()
+    cam_r = ThreadedCamera(CONFIG["right_id"]).start()
+    time.sleep(1.0) 
 
-    # Calibrate left (top) camera
-    H_left = calibrate_camera(cam_l, LEFT_CAM_ID, "left", "Calibrate LEFT (Top)")
+    phases = ["left", "right", "done"]
+    current_phase_idx = 0
+    current_pt_idx = 0
+    
+    image_points = {"left": [], "right": []}
 
-    # Verify left
-    if H_left is not None:
-        verify_calibration(cam_l, LEFT_CAM_ID, "left", H_left, "Verify LEFT")
+    print("\n>>> INSTRUCTIONS:")
+    print("Place the ball at the requested location and hold it still.")
+    print("Press [SPACEBAR] to lock the coordinate.")
+    print("Press [R] to restart the current camera.")
+    print("Press [Q] to quit immediately.\n")
 
-    # Calibrate right (bottom) camera
-    H_right = calibrate_camera(cam_r, RIGHT_CAM_ID, "right", "Calibrate RIGHT (Bottom)")
+    try:
+        while True:
+            phase = phases[current_phase_idx]
+            if phase == "done":
+                print("\n[INFO] All calibrations completed perfectly!")
+                break
 
-    # Verify right
-    if H_right is not None:
-        verify_calibration(cam_r, RIGHT_CAM_ID, "right", H_right, "Verify RIGHT")
+            ret_l, frame_l = cam_l.read()
+            ret_r, frame_r = cam_r.read()
+            if not ret_l or not ret_r: continue
 
-    # Summary
-    print("\n" + "=" * 50)
-    print("  CALIBRATION COMPLETE")
-    print("=" * 50)
-    if H_left is not None:
-        print(f"  ✓ Left  (ID {LEFT_CAM_ID}) → config/calibration_{LEFT_CAM_ID}.json")
-    else:
-        print(f"  ✗ Left  (ID {LEFT_CAM_ID}) — skipped")
-    if H_right is not None:
-        print(f"  ✓ Right (ID {RIGHT_CAM_ID}) → config/calibration_{RIGHT_CAM_ID}.json")
-    else:
-        print(f"  ✗ Right (ID {RIGHT_CAM_ID}) — skipped")
+            # Align with inference space (Horizontal Flip)
+            frame_l_inf = cv2.flip(frame_l, 1)
+            frame_r_inf = cv2.flip(frame_r, 1)
 
-    # Cleanup
-    cam_l.stop()
-    cam_r.stop()
-    cv2.destroyAllWindows()
-    print("[INFO] Done.")
+            # Inference
+            batch_input = np.stack([frame_l_inf, frame_r_inf])
+            results = model(batch_input)
+
+            # Active Camera Logic
+            if phase == "left":
+                active_frame = frame_l_inf
+                res = results[0]
+            else:
+                active_frame = frame_r_inf
+                res = results[1]
+
+            h, w = active_frame.shape[:2]
+            
+            # Find Ball
+            box = None
+            cx, cy = None, None
+            if len(res["boxes"]) > 0:
+                box = res["boxes"][0]
+                cx = (box[0] + box[2]) / 2.0
+                cy = (box[1] + box[3]) / 2.0
+
+            # -------------------------------------------------
+            # Display Logic
+            # -------------------------------------------------
+            # Vertical flip for human viewing
+            display = cv2.flip(active_frame, 0) 
+            
+            target_name, world_pt = CALIB_POINTS[phase][current_pt_idx]
+            
+            # Draw Box
+            if box is not None:
+                x1, y1, x2, y2 = map(int, box)
+                # Transform Y for the vertical display flip
+                draw_y1, draw_y2 = h - y2, h - y1
+                cv2.rectangle(display, (x1, draw_y1), (x2, draw_y2), (0, 255, 0), 2)
+                cv2.circle(display, (int(cx), h - int(cy)), 4, (0, 0, 255), -1)
+
+            # Draw HUD
+            cv2.rectangle(display, (0, 0), (w, 80), (0, 0, 0), -1)
+            cv2.putText(display, f"CALIBRATING: {phase.upper()} CAMERA", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(display, f"TARGET {current_pt_idx+1}/4: {target_name}", (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            status_text = "Press SPACE to lock" if box is not None else "NO BALL DETECTED"
+            status_color = (0, 255, 0) if box is not None else (0, 0, 255)
+            cv2.putText(display, status_text, (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
+
+            # Show previously clicked points
+            for pt in image_points[phase]:
+                px, py = int(pt[0]), h - int(pt[1])
+                cv2.circle(display, (px, py), 6, (255, 0, 0), -1)
+
+            cv2.imshow("AI Calibration", display)
+
+            # -------------------------------------------------
+            # Key Handling
+            # -------------------------------------------------
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('r'):
+                print(f"[INFO] Resetting {phase.upper()} camera points.")
+                image_points[phase] = []
+                current_pt_idx = 0
+            elif key == ord(' '):
+                if box is not None:
+                    image_points[phase].append([cx, cy])
+                    print(f" -> Locked Point {current_pt_idx+1}: Image({cx:.1f}, {cy:.1f}) mapped to World{world_pt}")
+                    
+                    current_pt_idx += 1
+                    
+                    if current_pt_idx == 4:
+                        # Compute Homography!
+                        src_pts = np.array(image_points[phase], dtype=np.float32)
+                        dst_pts = np.array([pt[1] for pt in CALIB_POINTS[phase]], dtype=np.float32)
+                        
+                        H, _ = cv2.findHomography(src_pts, dst_pts)
+                        if H is not None:
+                            save_calibration(phase, H)
+                            current_phase_idx += 1
+                            current_pt_idx = 0
+                        else:
+                            print("[ERROR] Homography failed. Resetting this side.")
+                            image_points[phase] = []
+                            current_pt_idx = 0
+
+    except KeyboardInterrupt: pass
+    finally:
+        cam_l.stop()
+        cam_r.stop()
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
