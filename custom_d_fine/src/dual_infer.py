@@ -32,7 +32,6 @@ CONFIG = {
 # --- FOOSBALL TABLE KINEMATICS ---
 TABLE_W = 343.5 + 20 
 TABLE_H = 586.0 + 20
-KICK_DIST_Y = 300.0
 
 ROD_Y = [150, -120, -420, -600] # Attacker, Midfield, Defender, Goalie
 PLAYERS_PER_ROD = [3, 5, 2, 3]
@@ -40,102 +39,117 @@ SPACING = [185.0, 127.5, 250.0, 185.0]
 LIMITS_STEPS = [2450, 1400, 3600, 2400]
 
 # --- PHYSICS TUNING ---
-VELOCITY_DEADBAND = 5.0     # Ignore noise < 5 mm/s
-WALL_BOUNCE_DAMP = 0.8      # Energy retained after wall bounce (0.0 - 1.0)
-PREDICTION_CAP_S = 0.35     # Max lookahead time to prevent wild guesses
+VELOCITY_DEADBAND = 5.0     
+WALL_BOUNCE_DAMP = 0.8      
+PREDICTION_CAP_S = 0.35     
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
 # ==============================================================================
-# GAME ENGINE (PORTED FROM C++)
+# GUI SETUP
+# ==============================================================================
+def setup_control_panel():
+    cv2.namedWindow("Control Panel", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Control Panel", 500, 350)
+    
+    # Trackbars (Name, Window, Default, Max, Callback)
+    # Range is 0-200. Subtract 100 in code to get -100 to +100 mm. Default is 100 (which means 0 offset).
+    cv2.createTrackbar("X_Off_Att (-100 to 100)", "Control Panel", 100, 200, lambda x: None)
+    cv2.createTrackbar("X_Off_Mid (-100 to 100)", "Control Panel", 100, 200, lambda x: None)
+    cv2.createTrackbar("X_Off_Def (-100 to 100)", "Control Panel", 100, 200, lambda x: None)
+    cv2.createTrackbar("X_Off_Goal (-100 to 100)", "Control Panel", 100, 200, lambda x: None)
+    
+    cv2.createTrackbar("Fwd_Offset (mm)", "Control Panel", 300, 600, lambda x: None)
+    cv2.createTrackbar("Back_Offset (mm)", "Control Panel", 50, 300, lambda x: None)
+    
+    cv2.createTrackbar("Wall Bounce (1=On)", "Control Panel", 1, 1, lambda x: None)
+    cv2.createTrackbar("Kalman (1=On)", "Control Panel", 0, 1, lambda x: None) 
+
+# ==============================================================================
+# GAME ENGINE (UNIFIED ZONE STRATEGY)
 # ==============================================================================
 class GameEngine:
     def __init__(self):
-        # Start all rods precisely in the middle
         self.last_linear_steps = [LIMITS_STEPS[0]//2, LIMITS_STEPS[1]//2, LIMITS_STEPS[2]//2, LIMITS_STEPS[3]//2]
 
-    def predict_intersection(self, ball_x: float, ball_y: float, vel_x: float, vel_y: float, rod_y: float) -> float:
+    def predict_intersection(self, ball_x: float, ball_y: float, vel_x: float, vel_y: float, rod_y: float, bounce_enabled: bool) -> float:
         """Predicts where the ball will cross a specific rod's Y-axis."""
         if abs(vel_y) < 10.0: 
-            return ball_x # Too slow to predict reliably
+            return ball_x 
             
         dy = rod_y - ball_y
         time_to_impact = dy / vel_y
 
         if time_to_impact > PREDICTION_CAP_S: time_to_impact = PREDICTION_CAP_S
-        if time_to_impact < 0: return ball_x # Moving away from this rod
+        if time_to_impact < 0: return ball_x 
 
         raw_pred_x = ball_x + (vel_x * time_to_impact)
         
-        # Wall Bounce Folding Logic
-        if raw_pred_x > TABLE_W:
-            return TABLE_W - ((raw_pred_x - TABLE_W) * WALL_BOUNCE_DAMP)
-        elif raw_pred_x < -TABLE_W:
-            return -TABLE_W + ((-TABLE_W - raw_pred_x) * WALL_BOUNCE_DAMP)
+        if bounce_enabled:
+            if raw_pred_x > TABLE_W:
+                return TABLE_W - ((raw_pred_x - TABLE_W) * WALL_BOUNCE_DAMP)
+            elif raw_pred_x < -TABLE_W:
+                return -TABLE_W + ((-TABLE_W - raw_pred_x) * WALL_BOUNCE_DAMP)
             
         return raw_pred_x
 
-    def get_motor_commands(self, ball_x: float, ball_y: float, vel_x: float, vel_y: float) -> Tuple[list, list]:
-        """Calculates Step targets and Kick states for all 8 motors."""
+    def get_motor_commands(self, ball_x: float, ball_y: float, vel_x: float, vel_y: float, params: dict) -> Tuple[list, list, list, list]:
+        """Unified Zone Logic Strategy with per-rod X-Offsets."""
         targets_l = [0, 0, 0, 0]
         targets_r = [0, 0, 0, 0]
-        
-        safe_ball_x = max(-TABLE_W, min(ball_x, TABLE_W))
+        active_rods = [False, False, False, False]
+        target_xs = [None, None, None, None] # Used for the minimap visualizer
         
         for i in range(4):
             rod_y = ROD_Y[i]
-            target_x = safe_ball_x
-            is_ball_coming = False
+            
+            # 1. Apply Live Manual X-Offset specific to this rod
+            adj_ball_x = ball_x + params['x_offsets'][i]
+            safe_ball_x = max(-TABLE_W, min(adj_ball_x, TABLE_W))
+            
+            # 2. Check operational zone
+            in_zone = (rod_y - params['back_offset']) <= ball_y <= (rod_y + params['fwd_offset'])
 
-            # --- 1. STRATEGY (Attack vs Defend) ---
-            if i >= 2: 
-                # DEFENDERS: React fast if ball is coming towards me (-Y)
-                if vel_y < -5.0: is_ball_coming = True
-            else: 
-                # ATTACKERS: Intercept if moving forward or slow
-                if vel_y > 5.0 or abs(vel_y) < 2.0: is_ball_coming = True
-
-            if is_ball_coming:
-                target_x = self.predict_intersection(ball_x, ball_y, vel_x, vel_y, rod_y)
-
-            # --- 2. KINEMATICS (Stepper Selection) ---
-            target_x = max(-TABLE_W, min(target_x, TABLE_W))
-            count = PLAYERS_PER_ROD[i]
-            space = SPACING[i]
-            max_steps = LIMITS_STEPS[i]
-            
-            best_steps = -1
-            min_dist = float('inf')
-            
-            for p in range(count):
-                player_offset = (p - (count - 1) / 2.0) * space
-                required_rod_pos = target_x - player_offset
+            if in_zone:
+                active_rods[i] = True
                 
-                percent = (required_rod_pos + TABLE_W) / (2.0 * TABLE_W)
-                req_steps = percent * max_steps
+                # 3. Predict and Clamp
+                target_x = self.predict_intersection(safe_ball_x, ball_y, vel_x, vel_y, rod_y, params['bounce'])
+                target_x = max(-TABLE_W, min(target_x, TABLE_W))
+                target_xs[i] = target_x # Save for drawing
                 
-                if 0 <= req_steps <= max_steps:
-                    dist = abs(self.last_linear_steps[i] - req_steps)
-                    if dist < min_dist:
-                        min_dist = dist
-                        best_steps = req_steps
-            
-            if best_steps < 0:
-                best_steps = 0 if target_x > 0 else max_steps
+                count = PLAYERS_PER_ROD[i]
+                space = SPACING[i]
+                max_steps = LIMITS_STEPS[i]
                 
-            targets_l[i] = int(best_steps)
-            self.last_linear_steps[i] = int(best_steps)
-            
-            # --- 3. KICK LOGIC (FIXED) ---
-            # Is the ball in the "Kill Zone" 60mm in front of this specific rod?
-            ball_in_kill_zone = (rod_y < ball_y < (rod_y + KICK_DIST_Y))
-            
-            if ball_in_kill_zone:
-                targets_r[i] = 1 # 1 = KICK!
+                best_steps = -1
+                min_dist = float('inf')
+                
+                for p in range(count):
+                    player_offset = (p - (count - 1) / 2.0) * space
+                    required_rod_pos = target_x - player_offset
+                    
+                    percent = (required_rod_pos + TABLE_W) / (2.0 * TABLE_W)
+                    req_steps = percent * max_steps
+                    
+                    if 0 <= req_steps <= max_steps:
+                        dist = abs(self.last_linear_steps[i] - req_steps)
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_steps = req_steps
+                
+                if best_steps < 0:
+                    best_steps = 0 if target_x > 0 else max_steps
+                    
+                targets_l[i] = int(best_steps)
+                self.last_linear_steps[i] = int(best_steps)
+                targets_r[i] = 1 
+                
             else:
-                targets_r[i] = 0 # 0 = BLOCK (Feet Down)
+                targets_l[i] = self.last_linear_steps[i]
+                targets_r[i] = 0 
                 
-        return targets_l, targets_r
+        return targets_l, targets_r, active_rods, target_xs
 
 # ==============================================================================
 # COORDINATE MAPPER & CAMERA CLASSES
@@ -212,12 +226,58 @@ def get_ball_contact_point(box):
     x1, y1, x2, y2 = map(int, box)
     return (x1 + x2) / 2, (y1 + y2) / 2, x1, y1, x2, y2
 
+def draw_radar_minimap(display, ball_x, ball_y, target_xs, params, active_rods):
+    """Draws a 2D top-down mini-map on the screen for live visual debugging."""
+    scale = 0.20
+    map_w, map_h = int(TABLE_W * 2 * scale), int(TABLE_H * 2 * scale)
+    pad = 20
+    
+    # Position map in top right corner
+    sx = display.shape[1] - map_w - pad
+    sy = pad
+    
+    # Draw Table Background
+    cv2.rectangle(display, (sx, sy), (sx + map_w, sy + map_h), (30, 60, 30), -1)
+    cv2.rectangle(display, (sx, sy), (sx + map_w, sy + map_h), (200, 200, 200), 2)
+    
+    def to_map(wx, wy):
+        mx = sx + int((wx + TABLE_W) * scale)
+        my = sy + int((TABLE_H - wy) * scale) # Flip Y so Opponent (+Y) is at top
+        return mx, my
+
+    # Draw Rods, Zones, and Targets
+    for i, rod_y in enumerate(ROD_Y):
+        # 1. Zone Bracket
+        zx1, zy1 = to_map(-TABLE_W, rod_y + params['fwd_offset'])
+        zx2, zy2 = to_map(TABLE_W, rod_y - params['back_offset'])
+        
+        if active_rods[i]:
+            cv2.rectangle(display, (zx1, zy1), (zx2, zy2), (0, 255, 0), cv2.FILLED)
+            cv2.rectangle(display, (zx1, zy1), (zx2, zy2), (255, 255, 255), 1)
+        else:
+            cv2.rectangle(display, (zx1, zy1), (zx2, zy2), (100, 100, 100), 1)
+        
+        # 2. Solid Rod Line
+        rx1, ry = to_map(-TABLE_W, rod_y)
+        rx2, _ = to_map(TABLE_W, rod_y)
+        cv2.line(display, (rx1, ry), (rx2, ry), (255, 255, 255), 2)
+
+        # 3. Draw Target Marker (where this specific rod is aiming)
+        if target_xs is not None and target_xs[i] is not None:
+            tx, ty = to_map(target_xs[i], rod_y)
+            cv2.circle(display, (tx, ty), 3, (0, 255, 255), -1) # Yellow Dot for Aim
+
+    # Draw Ball (Raw Camera Input)
+    if ball_x is not None:
+        bx, by = to_map(ball_x, ball_y)
+        cv2.circle(display, (bx, by), 4, (0, 0, 255), -1) # Red Dot
+
 # ==============================================================================
 # MAIN LOOP
 # ==============================================================================
 def main():
     print("==========================================")
-    print("   PROJECT PINPOINT: PHASE 2 (PYTHON LOGIC)   ")
+    print("   PROJECT PINPOINT: PHASE 1 (LIVE TUNING)    ")
     print("==========================================")
     
     try:
@@ -254,6 +314,10 @@ def main():
         print(f"[WARNING] Could not open serial port: {e}")
 
     engine = GameEngine()
+    
+    if CONFIG["visualize"]:
+        setup_control_panel()
+
     print(">>> TRACKING STARTED. Press 'q' to quit.")
     
     prev_time = 0
@@ -261,6 +325,24 @@ def main():
     
     try:
         while True:
+            # 0. READ GUI SLIDERS
+            params = {
+                'x_offsets': [0, 0, 0, 0],
+                'fwd_offset': 300, 'back_offset': 50, 
+                'bounce': True, 'kalman': False
+            }
+            if CONFIG["visualize"]:
+                params['x_offsets'] = [
+                    cv2.getTrackbarPos("X_Off_Att (-100 to 100)", "Control Panel") - 100,
+                    cv2.getTrackbarPos("X_Off_Mid (-100 to 100)", "Control Panel") - 100,
+                    cv2.getTrackbarPos("X_Off_Def (-100 to 100)", "Control Panel") - 100,
+                    cv2.getTrackbarPos("X_Off_Goal (-100 to 100)", "Control Panel") - 100
+                ]
+                params['fwd_offset'] = cv2.getTrackbarPos("Fwd_Offset (mm)", "Control Panel")
+                params['back_offset'] = cv2.getTrackbarPos("Back_Offset (mm)", "Control Panel")
+                params['bounce'] = bool(cv2.getTrackbarPos("Wall Bounce (1=On)", "Control Panel"))
+                params['kalman'] = bool(cv2.getTrackbarPos("Kalman (1=On)", "Control Panel"))
+
             # 1. TIME & PERCEPTION
             curr_time = time.time()
             dt = curr_time - prev_time if prev_time > 0 else 0.016
@@ -269,7 +351,6 @@ def main():
             ret_l, frame_l = cam_l.read()
             ret_r, frame_r = cam_r.read()
             
-            # Apply Horizontal Flip for inference
             frame_l = cv2.flip(frame_l, 1)
             frame_r = cv2.flip(frame_r, 1)  
             
@@ -305,7 +386,7 @@ def main():
                     det_r = (wx, wy, x1, y1, x2, y2)
                     cx_r, cy_r = cx, cy
 
-            # 2. DATA FUSION (Weighted by Distance from Center)
+            # 2. DATA FUSION
             final_x, final_y = None, None
             if ball_pos_l and ball_pos_r:
                 center_l = np.array([w_l / 2, h_l / 2])
@@ -324,23 +405,22 @@ def main():
             # 3. KINEMATICS & SERIAL TRANSMISSION
             msg = None
             vel_x, vel_y = 0.0, 0.0
+            active_rods = [False, False, False, False]
+            target_xs = None
             
             if final_x is not None:
-                # Raw Velocity Calc
                 if prev_ball_pos is not None and dt > 0.005:
                     raw_vx = (final_x - prev_ball_pos[0]) / dt
                     raw_vy = (final_y - prev_ball_pos[1]) / dt
                     
-                    # Apply Noise Deadband
                     vel_x = raw_vx if abs(raw_vx) > VELOCITY_DEADBAND else 0.0
                     vel_y = raw_vy if abs(raw_vy) > VELOCITY_DEADBAND else 0.0
                     
                 prev_ball_pos = (final_x, final_y)
 
-                # Fetch Commands from Game Engine
-                target_l, target_r = engine.get_motor_commands(final_x, final_y, vel_x, vel_y)
+                # Send Live Parameters to Game Engine
+                target_l, target_r, active_rods, target_xs = engine.get_motor_commands(final_x, final_y, vel_x, vel_y, params)
 
-                # Format exact string for the new Teensy parser
                 msg = f"<{target_l[0]},{target_r[0]},{target_l[1]},{target_r[1]},{target_l[2]},{target_r[2]},{target_l[3]},{target_r[3]}>\n"
                 
                 if ser and ser.is_open:
@@ -351,11 +431,9 @@ def main():
 
             # 4. VISUALIZATION & TELEMETRY
             if CONFIG["visualize"]:
-                # Flip for correct orientation viewing
                 frame_l = cv2.flip(frame_l, 0)
                 frame_r = cv2.flip(frame_r, 0)
 
-                # Draw Bounding Boxes on individual frames
                 if det_l:
                     wx, wy, x1, y1, x2, y2 = det_l
                     y1_f, y2_f = h_l - y2, h_l - y1
@@ -370,7 +448,6 @@ def main():
                     cv2.putText(frame_r, f"R: {wx:.0f},{wy:.0f}", (x1, y1_f-10), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-                # Stack and Scale
                 fps = 1 / dt if dt > 0 else 0
                 display = np.vstack((frame_l, frame_r))
                 
@@ -378,16 +455,17 @@ def main():
                 new_w, new_h = int(display.shape[1]*scale), int(display.shape[0]*scale)
                 display = cv2.resize(display, (new_w, new_h))
                 
-                # Formulate Telemetry Text
+                # --- DRAW THE MINI-MAP RADAR ---
+                draw_radar_minimap(display, final_x, final_y, target_xs, params, active_rods)
+
                 if final_x is not None:
                     hud_text_1 = f"BALL POS: X={final_x:.0f}mm, Y={final_y:.0f}mm | VelY: {vel_y:.0f} mm/s"
-                    color = (50, 255, 50) # Bright Green
+                    color = (50, 255, 50) 
                 else:
                     hud_text_1 = "BALL POS: [LOST]"
-                    color = (50, 50, 255) # Bright Red
+                    color = (50, 50, 255) 
                 
                 if msg is not None:
-                    # Highlight if a kick is currently triggering
                     if "1" in msg:
                         hud_text_2 = f"SERIAL OUT: {msg.strip()}   >>> KICKING! <<<"
                     else:
@@ -395,13 +473,10 @@ def main():
                 else:
                     hud_text_2 = "SERIAL OUT: [IDLE]"
 
-                # Draw HUD Background (Dark Grey Bar)
                 cv2.rectangle(display, (0, 0), (new_w, 85), (20, 20, 20), -1) 
-                
-                # Draw Text Overlay
                 cv2.putText(display, hud_text_1, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                cv2.putText(display, hud_text_2, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2) # Yellow/Cyan
-                cv2.putText(display, f"FPS: {fps:.0f}", (new_w - 140, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                cv2.putText(display, hud_text_2, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2) 
+                cv2.putText(display, f"FPS: {fps:.0f}", (new_w - 300, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                 
                 cv2.imshow("Project Pinpoint DEBUG", display)
                 if cv2.waitKey(1) & 0xFF == ord('q'): break
